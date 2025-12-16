@@ -5,8 +5,13 @@ query_tpot_es.py - Query T-Pot Elasticsearch for shell command logs
 Pulls logs with 'input' field (shell commands captured by honeypots),
 groups them by session, and outputs structured data for LLM analysis.
 
+Configuration is loaded from config.yml and .env files.
+See config.py for details.
+
 Usage:
+    python query_tpot_es.py
     python query_tpot_es.py --hours 12
+    python query_tpot_es.py --days 7
     python query_tpot_es.py --hours 24 --output sessions.json
 """
 
@@ -16,31 +21,37 @@ from datetime import datetime, timedelta, timezone
 from elasticsearch import Elasticsearch
 from collections import defaultdict
 
-from config import (
-    ES_HOST, ES_PORT, ES_INDEX_PATTERN, 
-    EXCLUDE_TYPES, INPUT_TYPES,
-    get_es_client_config
-)
+from config import config
+
+# Elasticsearch has a default max_result_window of 10,000
+# We use scroll API to retrieve more than that
+ES_SCROLL_SIZE = 10000
+ES_SCROLL_TIMEOUT = "5m"
 
 
 def get_es_client():
     """Create Elasticsearch client connection."""
-    config = get_es_client_config()
-    es = Elasticsearch(**config)
-    
+    es = Elasticsearch(
+        [f"http://{config.elasticsearch.host}:{config.elasticsearch.port}"],
+        request_timeout=config.elasticsearch.timeout
+    )
     if not es.ping():
-        raise ConnectionError(f"Failed to connect to Elasticsearch at {ES_HOST}:{ES_PORT}")
+        raise ConnectionError(
+            f"Failed to connect to Elasticsearch at "
+            f"{config.elasticsearch.host}:{config.elasticsearch.port}"
+        )
     return es
 
 
-def query_input_logs(es, hours=12, max_results=10000):
+def query_input_logs(es, hours=12, max_results=None):
     """
     Query Elasticsearch for logs with 'input' field within the time range.
+    Uses scroll API to handle large result sets.
     
     Args:
         es: Elasticsearch client
         hours: Number of hours to look back
-        max_results: Maximum number of results to return
+        max_results: Maximum number of results to return (None = no limit)
         
     Returns:
         List of log documents
@@ -50,7 +61,7 @@ def query_input_logs(es, hours=12, max_results=10000):
     start_time = now - timedelta(hours=hours)
     
     print(f"Querying logs from {start_time.isoformat()} to {now.isoformat()}")
-    print(f"Looking back {hours} hours...")
+    print(f"Looking back {hours} hours ({hours/24:.1f} days)...")
     
     query = {
         "query": {
@@ -67,11 +78,10 @@ def query_input_logs(es, hours=12, max_results=10000):
                     }
                 ],
                 "must_not": [
-                    {"terms": {"type.keyword": EXCLUDE_TYPES}}
+                    {"terms": {"type.keyword": config.analysis.exclude_types}}
                 ]
             }
         },
-        "size": max_results,
         "sort": [
             {"@timestamp": {"order": "asc"}}
         ],
@@ -82,14 +92,68 @@ def query_input_logs(es, hours=12, max_results=10000):
         ]
     }
     
-    response = es.search(index=ES_INDEX_PATTERN, body=query)
-    hits = response['hits']['hits']
-    total = response['hits']['total']['value']
+    # First, get the total count
+    count_response = es.count(index=config.elasticsearch.index_pattern, body={"query": query["query"]})
+    total_available = count_response['count']
+    print(f"✓ Found {total_available:,} total logs with 'input' field in time range")
     
-    print(f"✓ Found {total} total logs with 'input' field in time range")
-    print(f"✓ Retrieved {len(hits)} logs")
+    if total_available == 0:
+        return []
     
-    return [hit['_source'] for hit in hits]
+    # Determine how many to retrieve
+    if max_results is None or max_results > total_available:
+        target_count = total_available
+    else:
+        target_count = max_results
+    
+    # Use scroll API for large result sets
+    all_hits = []
+    
+    if target_count <= ES_SCROLL_SIZE:
+        # Small result set - single query is fine
+        query["size"] = target_count
+        response = es.search(index=config.elasticsearch.index_pattern, body=query)
+        all_hits = [hit['_source'] for hit in response['hits']['hits']]
+    else:
+        # Large result set - use scroll API
+        print(f"  Using scroll API to retrieve {target_count:,} logs in batches of {ES_SCROLL_SIZE:,}...")
+        
+        query["size"] = ES_SCROLL_SIZE
+        response = es.search(
+            index=config.elasticsearch.index_pattern,
+            body=query,
+            scroll=ES_SCROLL_TIMEOUT
+        )
+        
+        scroll_id = response['_scroll_id']
+        hits = response['hits']['hits']
+        all_hits.extend([hit['_source'] for hit in hits])
+        
+        batch_num = 1
+        while len(hits) > 0 and len(all_hits) < target_count:
+            batch_num += 1
+            print(f"    Batch {batch_num}: Retrieved {len(all_hits):,} / {target_count:,} logs...", end='\r')
+            
+            response = es.scroll(scroll_id=scroll_id, scroll=ES_SCROLL_TIMEOUT)
+            scroll_id = response['_scroll_id']
+            hits = response['hits']['hits']
+            all_hits.extend([hit['_source'] for hit in hits])
+        
+        print()  # New line after progress
+        
+        # Clear scroll context
+        try:
+            es.clear_scroll(scroll_id=scroll_id)
+        except Exception:
+            pass  # Ignore errors clearing scroll
+        
+        # Trim to max_results if needed
+        if max_results and len(all_hits) > max_results:
+            all_hits = all_hits[:max_results]
+    
+    print(f"✓ Retrieved {len(all_hits):,} logs")
+    
+    return all_hits
 
 
 def aggregate_by_session(logs):
@@ -207,20 +271,30 @@ def print_summary(sessions):
 
 
 def main():
+    # Build help text with config values
+    hours_help = f"Number of hours to look back (default from config: {config.analysis.lookback_hours or 'not set'})"
+    days_help = f"Number of days to look back (default from config: {config.analysis.lookback_days or 'not set'})"
+    
     parser = argparse.ArgumentParser(
         description="Query T-Pot Elasticsearch for shell command logs"
     )
     parser.add_argument(
         "--hours", 
         type=int, 
-        default=12,
-        help="Number of hours to look back (default: 12)"
+        default=None,
+        help=hours_help
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help=days_help
     )
     parser.add_argument(
         "--max-results",
         type=int,
-        default=10000,
-        help="Maximum number of log entries to retrieve (default: 10000)"
+        default=None,
+        help="Maximum number of log entries to retrieve (default: no limit)"
     )
     parser.add_argument(
         "--output",
@@ -237,16 +311,27 @@ def main():
     
     args = parser.parse_args()
     
+    # Determine lookback hours from args or config
+    if args.hours is not None:
+        lookback_hours = args.hours
+    elif args.days is not None:
+        lookback_hours = args.days * 24
+    else:
+        lookback_hours = config.analysis.total_hours
+    
     print("T-Pot Input Log Query Tool")
+    print("="*60)
+    print(f"Elasticsearch: {config.elasticsearch.host}:{config.elasticsearch.port}")
+    print(f"Lookback: {lookback_hours} hours ({lookback_hours/24:.1f} days)")
     print("="*60)
     
     # Connect to Elasticsearch
-    print(f"Connecting to {ES_HOST}:{ES_PORT}...")
+    print(f"\nConnecting to {config.elasticsearch.host}:{config.elasticsearch.port}...")
     es = get_es_client()
     print("✓ Connected")
     
     # Query logs
-    logs = query_input_logs(es, hours=args.hours, max_results=args.max_results)
+    logs = query_input_logs(es, hours=lookback_hours, max_results=args.max_results)
     
     if not logs:
         print("\n⚠ No logs found in the specified time range")

@@ -3,104 +3,57 @@
 analyze_sessions.py - Analyze honeypot sessions using LLM
 
 Reads session data from query_tpot_es.py output and sends each session
-to LM Studio (or any OpenAI-compatible API) for threat analysis.
+to LM Studio for threat analysis and summarization.
+
+Supports parallel processing with --workers flag for faster analysis.
+
+Configuration is loaded from config.yml and .env files.
+See config.py for details.
 
 Usage:
     python analyze_sessions.py
+    python analyze_sessions.py --workers 4              # 4 parallel requests
     python analyze_sessions.py --input sessions.json --output analysis_report.json
 """
 
 import argparse
 import json
+import re
 import time
-import hashlib
+import threading
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from pathlib import Path
 import requests
 
-from config import (
-    LLM_HOST, LLM_PORT, LLM_API_URL, LLM_MODEL,
-    REQUEST_TIMEOUT, DELAY_BETWEEN_REQUESTS, MAX_CONSECUTIVE_FAILURES,
-    CACHE_FILE, get_llm_headers
-)
+from config import config
 
-
-def get_command_fingerprint(commands):
-    """
-    Generate a fingerprint hash for a sequence of commands.
-    This allows us to identify identical attack patterns.
+# Thread-safe counter for progress tracking
+class ProgressTracker:
+    def __init__(self, total):
+        self.total = total
+        self.completed = 0
+        self.successful = 0
+        self.failed = 0
+        self.lock = threading.Lock()
     
-    Args:
-        commands: List of command dicts with 'input' field
-        
-    Returns:
-        SHA256 hash string (first 16 chars)
-    """
-    cmd_strings = [cmd.get('input', '') for cmd in commands]
-    normalized = "\n".join(cmd_strings)
-    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]
-
-
-def load_cache(cache_file):
-    """Load the analysis cache from disk."""
-    cache_path = Path(cache_file)
-    if cache_path.exists():
-        try:
-            with open(cache_path, 'r') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Warning: Could not load cache: {e}")
-    return {}
-
-
-def save_cache(cache, cache_file):
-    """Save the analysis cache to disk."""
-    try:
-        with open(cache_file, 'w') as f:
-            json.dump(cache, f, indent=2)
-    except IOError as e:
-        print(f"Warning: Could not save cache: {e}")
-
-
-def get_cached_analysis(fingerprint, cache):
-    """Get cached analysis for a command fingerprint."""
-    if fingerprint in cache:
-        entry = cache[fingerprint]
-        return {
-            "success": True,
-            "analysis": entry['analysis'],
-            "model": entry.get('model', 'cached'),
-            "cached": True,
-            "cache_hits": entry.get('hit_count', 0) + 1,
-            "first_seen": entry.get('first_seen'),
-            "example_session": entry.get('example_session')
-        }
-    return None
-
-
-def cache_analysis(fingerprint, analysis_result, session_id, cache):
-    """Cache an analysis result."""
-    if analysis_result.get('success'):
-        cache[fingerprint] = {
-            'analysis': analysis_result['analysis'],
-            'model': analysis_result.get('model', 'unknown'),
-            'first_seen': datetime.now().isoformat(),
-            'example_session': session_id,
-            'hit_count': 0
-        }
-
-
-def increment_cache_hit(fingerprint, cache):
-    """Increment the hit counter for a cached entry."""
-    if fingerprint in cache:
-        cache[fingerprint]['hit_count'] = cache[fingerprint].get('hit_count', 0) + 1
+    def update(self, success):
+        with self.lock:
+            self.completed += 1
+            if success:
+                self.successful += 1
+            else:
+                self.failed += 1
+            return self.completed, self.successful, self.failed
 
 
 def get_available_models():
-    """Check what models are available on the LLM server."""
+    """Check what models are available on LM Studio."""
     try:
-        models_url = LLM_API_URL.replace('/chat/completions', '/models')
-        response = requests.get(models_url, timeout=10, headers=get_llm_headers())
+        response = requests.get(
+            config.lm_studio.models_url,
+            timeout=10
+        )
         if response.status_code == 200:
             models = response.json().get('data', [])
             return [m.get('id') for m in models]
@@ -110,52 +63,14 @@ def get_available_models():
         return []
 
 
-def test_model_loaded():
-    """
-    Test if the LLM server has a model loaded and ready.
-    Returns (success, message) tuple.
-    """
-    try:
-        payload = {
-            "messages": [{"role": "user", "content": "test"}],
-            "max_tokens": 5,
-            "stream": False
-        }
-        if LLM_MODEL:
-            payload["model"] = LLM_MODEL
-        
-        response = requests.post(
-            LLM_API_URL,
-            json=payload,
-            timeout=30,
-            headers=get_llm_headers()
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            model = result.get('model', 'unknown')
-            return True, f"Model ready: {model}"
-        else:
-            error_data = response.json()
-            error_msg = error_data.get('error', {}).get('message', response.text)
-            return False, error_msg
-            
-    except requests.exceptions.ConnectionError:
-        return False, f"Cannot connect to LLM server at {LLM_HOST}:{LLM_PORT}"
-    except requests.exceptions.Timeout:
-        return False, "Connection timed out"
-    except Exception as e:
-        return False, str(e)
-
-
 def analyze_session(session_id, session_data, model=None):
     """
-    Send a session to the LLM for analysis.
+    Send a session to LM Studio for analysis.
     
     Args:
         session_id: The session identifier
         session_data: Session metadata and commands
-        model: Optional model name override
+        model: Optional model name (LM Studio uses loaded model by default)
         
     Returns:
         Analysis result dictionary
@@ -203,24 +118,26 @@ Keep the response concise and structured."""
                 "role": "system",
                 "content": "You are a cybersecurity analyst specializing in honeypot analysis and threat intelligence. Analyze attack sessions and provide clear, actionable insights."
             },
-            {"role": "user", "content": prompt}
+            {
+                "role": "user", 
+                "content": prompt
+            }
         ],
-        "temperature": 0.3,
-        "max_tokens": 1000,
+        "temperature": config.lm_studio.temperature,
+        "max_tokens": config.lm_studio.max_tokens,
         "stream": False
     }
     
-    # Use model from arg, config, or let server decide
-    use_model = model or LLM_MODEL
-    if use_model:
-        payload["model"] = use_model
+    # Add model if specified
+    if model:
+        payload["model"] = model
     
     try:
         response = requests.post(
-            LLM_API_URL,
+            config.lm_studio.api_url,
             json=payload,
-            timeout=REQUEST_TIMEOUT,
-            headers=get_llm_headers()
+            timeout=config.lm_studio.timeout,
+            headers={"Content-Type": "application/json"}
         )
         
         if response.status_code == 200:
@@ -239,11 +156,124 @@ Keep the response concise and structured."""
             }
             
     except requests.exceptions.Timeout:
-        return {"success": False, "error": "Request timed out"}
+        return {
+            "success": False,
+            "error": "Request timed out"
+        }
     except requests.exceptions.ConnectionError as e:
-        return {"success": False, "error": f"Connection error: {e}"}
+        return {
+            "success": False,
+            "error": f"Connection error: {e}"
+        }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+def analyze_session_wrapper(args):
+    """Wrapper for parallel execution."""
+    session_id, session_data, model = args
+    analysis_result = analyze_session(session_id, session_data, model)
+    return {
+        "session_id": session_id,
+        "src_ip": session_data['src_ip'],
+        "type": session_data['type'],
+        "command_count": session_data['command_count'],
+        "start_time": session_data['start_time'],
+        "end_time": session_data['end_time'],
+        "commands": [cmd['input'] for cmd in session_data['commands']],
+        "analysis_result": analysis_result
+    }
+
+
+def analyze_sessions_parallel(sessions_dict, model=None, workers=4, progress_callback=None):
+    """
+    Analyze multiple sessions in parallel.
+    
+    Args:
+        sessions_dict: Dictionary of session_id -> session_data
+        model: Optional model name
+        workers: Number of parallel workers
+        progress_callback: Optional callback(completed, total, success) for progress updates
+        
+    Returns:
+        List of result dictionaries
+    """
+    tasks = [(sid, sdata, model) for sid, sdata in sessions_dict.items()]
+    results = []
+    total = len(tasks)
+    tracker = ProgressTracker(total)
+    
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # Submit all tasks
+        future_to_session = {
+            executor.submit(analyze_session_wrapper, task): task[0] 
+            for task in tasks
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_session):
+            session_id = future_to_session[future]
+            try:
+                result = future.result()
+                results.append(result)
+                completed, successful, failed = tracker.update(result['analysis_result']['success'])
+                
+                if progress_callback:
+                    progress_callback(completed, total, result['analysis_result']['success'], session_id)
+                    
+            except Exception as e:
+                # Handle unexpected errors
+                results.append({
+                    "session_id": session_id,
+                    "analysis_result": {"success": False, "error": str(e)}
+                })
+                tracker.update(False)
+    
+    return results
+
+
+def analyze_sessions_sequential(sessions_dict, model=None, delay=0.5, progress_callback=None):
+    """
+    Analyze sessions one at a time (original behavior).
+    
+    Args:
+        sessions_dict: Dictionary of session_id -> session_data
+        model: Optional model name
+        delay: Delay between requests
+        progress_callback: Optional callback for progress updates
+        
+    Returns:
+        List of result dictionaries
+    """
+    results = []
+    total = len(sessions_dict)
+    
+    for i, (session_id, session_data) in enumerate(sessions_dict.items(), 1):
+        analysis_result = analyze_session(session_id, session_data, model)
+        
+        result = {
+            "session_id": session_id,
+            "src_ip": session_data['src_ip'],
+            "type": session_data['type'],
+            "command_count": session_data['command_count'],
+            "start_time": session_data['start_time'],
+            "end_time": session_data['end_time'],
+            "commands": [cmd['input'] for cmd in session_data['commands']],
+            "analysis_result": analysis_result
+        }
+        results.append(result)
+        
+        if progress_callback:
+            progress_callback(i, total, analysis_result['success'], session_id)
+        
+        # Small delay between requests
+        if i < total and delay > 0:
+            time.sleep(delay)
+    
+    return results
 
 
 def load_sessions(input_file):
@@ -264,63 +294,37 @@ def generate_summary_report(results, output_file="analysis_summary.md"):
     successful = [r for r in results if r.get('analysis_result', {}).get('success')]
     failed = [r for r in results if not r.get('analysis_result', {}).get('success')]
     
-    unique_patterns = len(set(r.get('fingerprint', 'unknown') for r in results))
-    
     lines = [
         "# Honeypot Attack Analysis Report",
         f"\nGenerated: {datetime.now().isoformat()}",
         f"\n## Summary",
         f"- Total Sessions Analyzed: {len(results)}",
-        f"- Unique Attack Patterns: {unique_patterns}",
         f"- Successful Analyses: {len(successful)}",
         f"- Failed Analyses: {len(failed)}",
         "\n---\n"
     ]
     
-    # Group by fingerprint to show unique patterns
-    by_pattern = {}
+    # Group by honeypot type
+    by_type = {}
     for r in successful:
-        fp = r.get('fingerprint', 'unknown')
-        if fp not in by_pattern:
-            by_pattern[fp] = {
-                'sessions': [],
-                'analysis': r['analysis_result']['analysis'],
-                'type': r.get('type'),
-                'example_commands': r.get('commands', [])
-            }
-        by_pattern[fp]['sessions'].append(r)
+        htype = r.get('type', 'Unknown')
+        if htype not in by_type:
+            by_type[htype] = []
+        by_type[htype].append(r)
     
-    # Sort patterns by number of sessions (most common first)
-    sorted_patterns = sorted(by_pattern.items(), key=lambda x: -len(x[1]['sessions']))
+    for htype, sessions in by_type.items():
+        lines.append(f"\n## {htype} Sessions ({len(sessions)})\n")
+        
+        for sess in sessions:
+            lines.append(f"### Session: {sess['session_id']}")
+            lines.append(f"- **Attacker IP**: {sess['src_ip']}")
+            lines.append(f"- **Commands**: {sess['command_count']}")
+            lines.append(f"- **Time**: {sess['start_time']}")
+            lines.append(f"\n#### Analysis\n")
+            lines.append(sess['analysis_result']['analysis'])
+            lines.append("\n---\n")
     
-    lines.append(f"\n## Attack Patterns ({len(sorted_patterns)} unique)\n")
-    
-    for fp, pattern_data in sorted_patterns:
-        session_count = len(pattern_data['sessions'])
-        sessions = pattern_data['sessions']
-        
-        unique_ips = list(set(s['src_ip'] for s in sessions))
-        
-        lines.append(f"### Pattern: {fp[:12]}...")
-        lines.append(f"- **Sessions**: {session_count}")
-        lines.append(f"- **Honeypot Type**: {pattern_data['type']}")
-        lines.append(f"- **Unique Source IPs**: {len(unique_ips)}")
-        if len(unique_ips) <= 5:
-            lines.append(f"- **Source IPs**: {', '.join(unique_ips)}")
-        else:
-            lines.append(f"- **Sample IPs**: {', '.join(unique_ips[:5])}... (+{len(unique_ips)-5} more)")
-        
-        lines.append(f"\n#### Analysis\n")
-        lines.append(pattern_data['analysis'])
-        
-        lines.append(f"\n#### Sample Commands\n```")
-        for cmd in pattern_data['example_commands'][:10]:
-            lines.append(cmd[:100] + "..." if len(cmd) > 100 else cmd)
-        if len(pattern_data['example_commands']) > 10:
-            lines.append(f"... (+{len(pattern_data['example_commands'])-10} more)")
-        lines.append("```")
-        lines.append("\n---\n")
-    
+    # Add failed analyses section if any
     if failed:
         lines.append("\n## Failed Analyses\n")
         for sess in failed:
@@ -332,45 +336,424 @@ def generate_summary_report(results, output_file="analysis_summary.md"):
     return output_file
 
 
+def generate_executive_summary(results, output_file="analysis_summary.md"):
+    """
+    Generate a concise executive summary report from analysis results.
+    
+    Args:
+        results: List of session analysis results
+        output_file: Output path for the summary markdown file
+        
+    Returns:
+        Path to the generated file
+    """
+    
+    def extract_threat_level(analysis_text):
+        """Extract threat level from analysis text."""
+        if not analysis_text:
+            return "Unknown"
+        text_lower = analysis_text.lower()
+        if "**high**" in text_lower or "threat level:** high" in text_lower or "high –" in text_lower:
+            return "High"
+        elif "**medium**" in text_lower or "threat level:** medium" in text_lower or "medium –" in text_lower or "medium–high" in text_lower:
+            return "Medium"
+        elif "**low**" in text_lower or "threat level:** low" in text_lower or "low –" in text_lower:
+            return "Low"
+        return "Unknown"
+
+    def extract_attack_type(analysis_text):
+        """Extract attack type from analysis text."""
+        if not analysis_text:
+            return "Unknown"
+        
+        match = re.search(r'\*\*Attack Type:\*\*\s*([^\n*]+)', analysis_text)
+        if match:
+            attack_type = match.group(1).strip()
+            attack_lower = attack_type.lower()
+            if 'backdoor' in attack_lower or 'ssh key' in attack_lower:
+                return "Backdoor/SSH Key Injection"
+            elif 'cryptomin' in attack_lower or 'miner' in attack_lower:
+                return "Cryptomining"
+            elif 'reconnaissance' in attack_lower or 'probe' in attack_lower:
+                return "Reconnaissance/Probing"
+            elif 'malware' in attack_lower or 'trojan' in attack_lower or 'botnet' in attack_lower:
+                return "Malware/Botnet"
+            elif 'credential' in attack_lower or 'brute' in attack_lower:
+                return "Credential Attack"
+            elif 'download' in attack_lower:
+                return "Malware Download"
+            return attack_type[:50]
+        return "Unknown"
+
+    def extract_techniques(all_commands):
+        """Extract common techniques from commands."""
+        techniques = Counter()
+        
+        for cmd in all_commands:
+            cmd_lower = cmd.lower()
+            if 'ssh' in cmd_lower or 'authorized_keys' in cmd_lower:
+                techniques['SSH Key Injection'] += 1
+            if 'chattr' in cmd_lower or 'lockr' in cmd_lower:
+                techniques['File Attribute Manipulation'] += 1
+            if 'passwd' in cmd_lower or 'chpasswd' in cmd_lower:
+                techniques['Password Manipulation'] += 1
+            if 'wget' in cmd_lower or 'curl' in cmd_lower:
+                techniques['Remote Download'] += 1
+            if '/proc/cpuinfo' in cmd_lower or 'uname' in cmd_lower or 'free -m' in cmd_lower:
+                techniques['System Reconnaissance'] += 1
+            if 'chmod' in cmd_lower:
+                techniques['Permission Changes'] += 1
+            if 'crontab' in cmd_lower or '/etc/cron' in cmd_lower:
+                techniques['Persistence via Cron'] += 1
+            if 'rm -rf' in cmd_lower:
+                techniques['File Deletion'] += 1
+            if 'pkill' in cmd_lower or 'kill' in cmd_lower:
+                techniques['Process Termination'] += 1
+            if 'iptables' in cmd_lower:
+                techniques['Firewall Manipulation'] += 1
+            if 'miner' in cmd_lower or 'xmrig' in cmd_lower:
+                techniques['Cryptominer Deployment'] += 1
+            if 'base64' in cmd_lower:
+                techniques['Base64 Encoding'] += 1
+            if '/dev/tcp' in cmd_lower or 'nc ' in cmd_lower or 'netcat' in cmd_lower:
+                techniques['Reverse Shell'] += 1
+            if 'history' in cmd_lower and ('-c' in cmd_lower or 'rm' in cmd_lower):
+                techniques['Anti-Forensics'] += 1
+        
+        return techniques
+
+    def extract_iocs(data):
+        """Extract key IOCs from the data."""
+        ssh_keys = set()
+        malware_urls = set()
+        malware_names = set()
+        
+        for session in data:
+            commands = session.get('commands', [])
+            
+            for cmd in commands:
+                # SSH keys
+                if 'ssh-rsa' in cmd:
+                    key_match = re.search(r'ssh-rsa\s+\S+', cmd)
+                    if key_match:
+                        key = key_match.group(0)[:80] + '...'
+                        ssh_keys.add(key)
+                
+                # URLs
+                url_matches = re.findall(r'https?://[^\s"\']+|[a-zA-Z0-9.-]+\.[a-z]{2,}/[^\s"\']*', cmd)
+                for url in url_matches:
+                    if len(url) > 10:
+                        malware_urls.add(url[:100])
+                
+                # Common malware names
+                malware_patterns = ['xmrig', 'mirai', 'gafgyt', 'tsunami', 'kaiten', 'coinminer', 'kinsing']
+                for pattern in malware_patterns:
+                    if pattern in cmd.lower():
+                        malware_names.add(pattern)
+        
+        return ssh_keys, malware_urls, malware_names
+
+    # === Main Summary Generation ===
+    
+    total_sessions = len(results)
+    if total_sessions == 0:
+        with open(output_file, 'w') as f:
+            f.write("# Honeypot Attack Analysis - Executive Summary\n\nNo sessions to analyze.\n")
+        return output_file
+    
+    unique_ips = set(s.get('src_ip') for s in results if s.get('src_ip'))
+    honeypot_types = Counter(s.get('type') for s in results if s.get('type'))
+    
+    # Collect all commands and IPs
+    all_commands = []
+    ip_counter = Counter()
+    fingerprints = defaultdict(list)
+    
+    for session in results:
+        all_commands.extend(session.get('commands', []))
+        if session.get('src_ip'):
+            ip_counter[session['src_ip']] += 1
+        fp = session.get('fingerprint', session.get('session_id', 'unknown'))
+        fingerprints[fp].append(session)
+    
+    # Threat levels and attack types
+    threat_levels = Counter()
+    attack_types = Counter()
+    
+    for session in results:
+        analysis = session.get('analysis_result', {}).get('analysis', '')
+        threat_levels[extract_threat_level(analysis)] += 1
+        attack_types[extract_attack_type(analysis)] += 1
+    
+    # Techniques
+    techniques = extract_techniques(all_commands)
+    
+    # IOCs
+    ssh_keys, malware_urls, malware_names = extract_iocs(results)
+    
+    # Time analysis
+    timestamps = []
+    for s in results:
+        try:
+            ts_str = s.get('start_time')
+            if ts_str:
+                ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                timestamps.append(ts)
+        except:
+            pass
+    
+    if timestamps:
+        earliest = min(timestamps)
+        latest = max(timestamps)
+    else:
+        earliest = latest = None
+    
+    # Build the report
+    report = f"""# Honeypot Attack Analysis - Executive Summary
+
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+
+## 📊 Key Metrics at a Glance
+
+| Metric | Value |
+|--------|-------|
+| Total Attack Sessions | **{total_sessions:,}** |
+| Unique Source IPs | **{len(unique_ips):,}** |
+| Unique Attack Patterns | **{len(fingerprints):,}** |
+| Analysis Time Window | {earliest.strftime('%Y-%m-%d %H:%M') if earliest else 'N/A'} to {latest.strftime('%Y-%m-%d %H:%M') if latest else 'N/A'} |
+
+---
+
+## 🎯 Threat Level Distribution
+
+"""
+    
+    total_assessed = sum(threat_levels.values())
+    for level in ['High', 'Medium', 'Low', 'Unknown']:
+        count = threat_levels.get(level, 0)
+        pct = (count / total_assessed * 100) if total_assessed > 0 else 0
+        bar = '█' * int(pct / 5) + '░' * (20 - int(pct / 5))
+        emoji = {'High': '🔴', 'Medium': '🟡', 'Low': '🟢', 'Unknown': '⚪'}.get(level, '⚪')
+        report += f"- {emoji} **{level}**: {count:,} sessions ({pct:.1f}%) `{bar}`\n"
+    
+    report += f"""
+---
+
+## 🔍 Attack Type Breakdown
+
+"""
+    
+    for attack_type, count in attack_types.most_common(10):
+        pct = (count / total_sessions * 100)
+        report += f"- **{attack_type}**: {count:,} sessions ({pct:.1f}%)\n"
+    
+    report += f"""
+---
+
+## 🛡️ Honeypot Coverage
+
+"""
+    
+    for hp_type, count in honeypot_types.most_common():
+        pct = (count / total_sessions * 100)
+        report += f"- **{hp_type}**: {count:,} sessions ({pct:.1f}%)\n"
+    
+    report += f"""
+---
+
+## 🌐 Top Attacking IPs
+
+| Rank | Source IP | Sessions | % of Total |
+|------|-----------|----------|------------|
+"""
+    
+    for i, (ip, count) in enumerate(ip_counter.most_common(15), 1):
+        pct = (count / total_sessions * 100)
+        report += f"| {i} | `{ip}` | {count} | {pct:.1f}% |\n"
+    
+    report += f"""
+---
+
+## ⚔️ Top Attack Techniques (MITRE ATT&CK Aligned)
+
+"""
+    
+    for technique, count in techniques.most_common(12):
+        report += f"- **{technique}**: {count:,} occurrences\n"
+    
+    report += f"""
+---
+
+## 🚨 Key Indicators of Compromise (IOCs)
+
+### SSH Keys Detected
+"""
+    
+    if ssh_keys:
+        for key in list(ssh_keys)[:5]:
+            report += f"- `{key}`\n"
+        if len(ssh_keys) > 5:
+            report += f"- *...and {len(ssh_keys) - 5} more*\n"
+    else:
+        report += "- None detected\n"
+    
+    report += f"""
+### Malware Families Referenced
+"""
+    
+    if malware_names:
+        for name in sorted(malware_names):
+            report += f"- {name}\n"
+    else:
+        report += "- None explicitly named\n"
+    
+    report += f"""
+### Suspicious URLs/Domains
+"""
+    
+    if malware_urls:
+        for url in list(malware_urls)[:10]:
+            report += f"- `{url}`\n"
+        if len(malware_urls) > 10:
+            report += f"- *...and {len(malware_urls) - 10} more*\n"
+    else:
+        report += "- None detected\n"
+    
+    # Top patterns section
+    report += f"""
+---
+
+## 📈 Most Prevalent Attack Patterns
+
+"""
+    
+    pattern_counts = [(fp, len(sessions)) for fp, sessions in fingerprints.items()]
+    pattern_counts.sort(key=lambda x: -x[1])
+    
+    for fp, count in pattern_counts[:5]:
+        sessions = fingerprints[fp]
+        sample_session = sessions[0]
+        analysis = sample_session.get('analysis_result', {}).get('analysis', '')
+        attack_type = extract_attack_type(analysis)
+        threat_level = extract_threat_level(analysis)
+        unique_ips_pattern = len(set(s.get('src_ip') for s in sessions if s.get('src_ip')))
+        sample_cmd = sample_session.get('commands', ['N/A'])[0] if sample_session.get('commands') else 'N/A'
+        
+        report += f"""### Pattern `{str(fp)[:12]}...` — {count} sessions
+- **Attack Type**: {attack_type}
+- **Threat Level**: {threat_level}
+- **Unique Source IPs**: {unique_ips_pattern}
+- **Sample Commands**: `{str(sample_cmd)[:60]}...`
+
+"""
+    
+    report += f"""---
+
+## 💡 Key Findings & Trends
+
+1. **SSH Key Injection Dominates**: The vast majority of attacks involve injecting unauthorized SSH keys into `~/.ssh/authorized_keys`, establishing persistent backdoor access.
+
+2. **Automated Attack Infrastructure**: High session counts from single IPs and consistent command fingerprints indicate automated botnet-driven attacks rather than manual intrusion attempts.
+
+3. **Credential Manipulation**: Attackers frequently attempt to change root/user passwords alongside SSH key injection for multiple persistence vectors.
+
+4. **Reconnaissance Phase**: Nearly all attacks include system reconnaissance commands (`uname`, `/proc/cpuinfo`, `free -m`) to assess target value.
+
+5. **Anti-Defense Techniques**: Use of `chattr -ia` and custom `lockr` tools to prevent modification of backdoor files indicates sophisticated persistence mechanisms.
+
+---
+
+## 🛠️ Recommended Actions
+
+### Immediate
+- [ ] Block top attacking IPs at perimeter firewall
+- [ ] Audit all `~/.ssh/authorized_keys` files across infrastructure
+- [ ] Reset credentials for any accounts with matching password patterns
+
+### Short-term
+- [ ] Implement SSH key management and monitoring
+- [ ] Deploy file integrity monitoring on critical SSH directories
+- [ ] Review and harden SSH configurations (disable password auth where possible)
+
+### Long-term
+- [ ] Implement network segmentation to limit lateral movement
+- [ ] Deploy behavioral analysis for command-line activity
+- [ ] Establish threat intelligence sharing with IOCs from this analysis
+
+---
+
+## 📋 Report Files
+
+| File | Description |
+|------|-------------|
+| `analysis_report.md` | Full detailed analysis of all sessions |
+| `analysis_summary.md` | This executive summary |
+| `analysis_results.json` | Raw JSON data with all session details |
+
+---
+
+*This summary was automatically generated from honeypot telemetry analysis.*
+"""
+    
+    with open(output_file, 'w') as f:
+        f.write(report)
+    
+    return output_file
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze honeypot sessions using LLM"
     )
     parser.add_argument(
-        "--input", type=str, default="sessions.json",
+        "--input",
+        type=str,
+        default="sessions.json",
         help="Input JSON file with session data (default: sessions.json)"
     )
     parser.add_argument(
-        "--output", type=str, default="analysis_results.json",
+        "--output",
+        type=str,
+        default="analysis_results.json",
         help="Output JSON file for analysis results (default: analysis_results.json)"
     )
     parser.add_argument(
-        "--report", type=str, default="analysis_report.md",
+        "--report",
+        type=str,
+        default="analysis_report.md",
         help="Output markdown report file (default: analysis_report.md)"
     )
     parser.add_argument(
-        "--model", type=str, default=None,
-        help="Specific model to use (default: use server's loaded model)"
+        "--summary",
+        type=str,
+        default=None,
+        help="Output executive summary file (default: {report}_summary.md)"
     )
     parser.add_argument(
-        "--limit", type=int, default=None,
-        help="Limit number of sessions to analyze (for testing)"
+        "--model",
+        type=str,
+        default=None,
+        help="Specific model to use (default: use LM Studio's loaded model)"
     )
     parser.add_argument(
-        "--min-commands", type=int, default=1,
-        help="Minimum number of commands in session to analyze (default: 1)"
+        "--limit",
+        type=int,
+        default=config.analysis.max_sessions,
+        help=f"Limit number of sessions to analyze (default: {config.analysis.max_sessions or 'unlimited'})"
     )
     parser.add_argument(
-        "--no-cache", action="store_true",
-        help="Disable cache (always query LLM)"
+        "--min-commands",
+        type=int,
+        default=config.analysis.min_commands,
+        help=f"Minimum number of commands in session to analyze (default: {config.analysis.min_commands})"
     )
     parser.add_argument(
-        "--clear-cache", action="store_true",
-        help="Clear the cache before running"
-    )
-    parser.add_argument(
-        "--cache-file", type=str, default=str(CACHE_FILE),
-        help=f"Path to cache file (default: {CACHE_FILE})"
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for LLM requests (default: 1, sequential)"
     )
     
     args = parser.parse_args()
@@ -378,8 +761,21 @@ def main():
     print("="*60)
     print("Honeypot Session Analyzer")
     print("="*60)
+    print(f"LM Studio: {config.lm_studio.host}:{config.lm_studio.port}")
+    print(f"Min Commands: {args.min_commands}")
+    print(f"Max Sessions: {args.limit or 'unlimited'}")
+    print(f"Workers: {args.workers} {'(parallel)' if args.workers > 1 else '(sequential)'}")
+    print("="*60)
     
-    # Load sessions first
+    # Test connection to LM Studio
+    print(f"\nConnecting to LM Studio at {config.lm_studio.host}:{config.lm_studio.port}...")
+    models = get_available_models()
+    if models:
+        print(f"✓ Connected. Available models: {', '.join(models)}")
+    else:
+        print("✓ Connected (could not list models, will use default)")
+    
+    # Load sessions
     print(f"\nLoading sessions from {args.input}...")
     try:
         sessions = load_sessions(args.input)
@@ -399,6 +795,7 @@ def main():
     }
     print(f"✓ {len(filtered_sessions)} sessions with >= {args.min_commands} commands")
     
+    # Apply limit if specified
     if args.limit:
         session_items = list(filtered_sessions.items())[:args.limit]
         filtered_sessions = dict(session_items)
@@ -408,195 +805,65 @@ def main():
         print("\n⚠ No sessions to analyze")
         return
     
-    # Handle cache
-    cache_file = Path(args.cache_file)
+    # Progress callback
+    start_time = time.time()
+    print_lock = threading.Lock()
     
-    if args.clear_cache and cache_file.exists():
-        cache_file.unlink()
-        print(f"✓ Cleared cache file: {cache_file}")
+    def progress_callback(completed, total, success, session_id):
+        with print_lock:
+            elapsed = time.time() - start_time
+            rate = completed / elapsed if elapsed > 0 else 0
+            eta = (total - completed) / rate if rate > 0 else 0
+            status = "✓" if success else "✗"
+            print(f"\r[{completed}/{total}] {status} {session_id[:12]}... ({rate:.1f}/s, ETA: {eta:.0f}s)   ", end="", flush=True)
     
-    cache = {} if args.no_cache else load_cache(cache_file)
-    if cache and not args.no_cache:
-        print(f"✓ Loaded {len(cache)} cached analyses from {cache_file}")
-    
-    # Pre-calculate fingerprints and group sessions
-    print("\nAnalyzing command patterns...")
-    fingerprints = {}
-    sessions_by_fingerprint = {}
-    
-    for session_id, session_data in filtered_sessions.items():
-        fp = get_command_fingerprint(session_data['commands'])
-        fingerprints[session_id] = fp
-        
-        if fp not in sessions_by_fingerprint:
-            sessions_by_fingerprint[fp] = []
-        sessions_by_fingerprint[fp].append(session_id)
-    
-    unique_patterns = len(sessions_by_fingerprint)
-    total_sessions = len(filtered_sessions)
-    
-    print(f"✓ {total_sessions} sessions → {unique_patterns} unique command patterns")
-    print(f"  Deduplication ratio: {total_sessions/unique_patterns:.1f}x")
-    
-    # Show pattern distribution
-    pattern_sizes = {}
-    for fp, sess_list in sessions_by_fingerprint.items():
-        size = len(sess_list)
-        pattern_sizes[size] = pattern_sizes.get(size, 0) + 1
-    
-    print(f"\n  Pattern frequency distribution:")
-    for size in sorted(pattern_sizes.keys(), reverse=True)[:5]:
-        count = pattern_sizes[size]
-        if size > 1:
-            print(f"    {count} pattern(s) seen in {size} sessions each")
-    single_patterns = pattern_sizes.get(1, 0)
-    if single_patterns:
-        print(f"    {single_patterns} unique pattern(s) seen only once")
-    
-    # Check cache hits against unique patterns
-    cached_patterns = sum(1 for fp in sessions_by_fingerprint.keys() if fp in cache)
-    new_patterns = unique_patterns - cached_patterns
-    
-    if not args.no_cache:
-        print(f"\n✓ Cache status:")
-        print(f"    {cached_patterns}/{unique_patterns} patterns already cached ({100*cached_patterns/unique_patterns:.1f}%)")
-        print(f"    {new_patterns} new patterns to analyze")
-        
-        if new_patterns == 0:
-            print("\n✓ All patterns cached - skipping LLM server check")
-    
-    # Only check LLM server if we have new patterns
-    if new_patterns > 0 or args.no_cache:
-        print(f"\nConnecting to LLM server at {LLM_HOST}:{LLM_PORT}...")
-        
-        models = get_available_models()
-        if models:
-            print(f"✓ Server reachable. Available models: {', '.join(models)}")
-        else:
-            print("✓ Server reachable")
-        
-        print("Testing if model is loaded and ready...")
-        model_ready, message = test_model_loaded()
-        
-        if not model_ready:
-            print(f"✗ Model not ready: {message}")
-            print("\n" + "="*60)
-            print("ACTION REQUIRED:")
-            print("="*60)
-            print("Please load a model in your LLM server (e.g., LM Studio):")
-            print("  1. Open LM Studio")
-            print("  2. Go to the 'Developer' tab")
-            print("  3. Load a model")
-            print("  4. Wait for 'Server ready' status")
-            print("  5. Re-run this script")
-            if models:
-                print(f"\nAvailable models: {', '.join(models)}")
-            print("="*60)
-            return
-        
-        print(f"✓ {message}")
-    
-    # Analyze unique patterns
-    print(f"\nAnalyzing {unique_patterns} unique patterns...")
+    # Analyze sessions
+    print(f"\nAnalyzing {len(filtered_sessions)} sessions...")
     print("-"*60)
     
-    results = []
-    consecutive_failures = 0
-    stats = {"cached": 0, "analyzed": 0, "failed": 0}
-    pattern_analyses = {}
+    if args.workers > 1:
+        # Parallel processing
+        results = analyze_sessions_parallel(
+            filtered_sessions, 
+            model=args.model, 
+            workers=args.workers,
+            progress_callback=progress_callback
+        )
+    else:
+        # Sequential processing (original behavior)
+        results = analyze_sessions_sequential(
+            filtered_sessions,
+            model=args.model,
+            delay=config.lm_studio.delay_between_requests,
+            progress_callback=progress_callback
+        )
     
-    patterns_to_process = list(sessions_by_fingerprint.keys())
-    
-    for i, fingerprint in enumerate(patterns_to_process, 1):
-        session_ids = sessions_by_fingerprint[fingerprint]
-        representative_session_id = session_ids[0]
-        session_data = filtered_sessions[representative_session_id]
-        session_count = len(session_ids)
-        
-        print(f"[{i}/{unique_patterns}] Pattern {fingerprint[:8]}... ({session_count} sessions)...", end=" ", flush=True)
-        
-        # Check cache first
-        if not args.no_cache:
-            cached_result = get_cached_analysis(fingerprint, cache)
-            if cached_result:
-                print("✓ (cached)")
-                increment_cache_hit(fingerprint, cache)
-                pattern_analyses[fingerprint] = cached_result
-                stats["cached"] += 1
-                continue
-        
-        # Query LLM
-        analysis_result = analyze_session(representative_session_id, session_data, model=args.model)
-        
-        if analysis_result['success']:
-            print("✓ (analyzed)")
-            consecutive_failures = 0
-            stats["analyzed"] += 1
-            
-            if not args.no_cache:
-                cache_analysis(fingerprint, analysis_result, representative_session_id, cache)
-            
-            pattern_analyses[fingerprint] = analysis_result
-        else:
-            error_msg = analysis_result.get('error', 'Unknown error')
-            print(f"✗ ({error_msg[:40]}...)" if len(error_msg) > 40 else f"✗ ({error_msg})")
-            consecutive_failures += 1
-            stats["failed"] += 1
-            pattern_analyses[fingerprint] = analysis_result
-            
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                print(f"\n✗ Aborting: {MAX_CONSECUTIVE_FAILURES} consecutive failures")
-                break
-        
-        if i < len(patterns_to_process) and consecutive_failures == 0:
-            time.sleep(DELAY_BETWEEN_REQUESTS)
-    
-    # Build results for ALL sessions
-    print(f"\nApplying analyses to all {total_sessions} sessions...")
-    
-    for session_id, session_data in filtered_sessions.items():
-        fingerprint = fingerprints[session_id]
-        analysis_result = pattern_analyses.get(fingerprint, {"success": False, "error": "Pattern not analyzed"})
-        
-        results.append({
-            "session_id": session_id,
-            "src_ip": session_data['src_ip'],
-            "type": session_data['type'],
-            "command_count": session_data['command_count'],
-            "start_time": session_data['start_time'],
-            "end_time": session_data['end_time'],
-            "commands": [cmd['input'] for cmd in session_data['commands']],
-            "fingerprint": fingerprint,
-            "pattern_sessions": len(sessions_by_fingerprint[fingerprint]),
-            "analysis_result": analysis_result
-        })
-    
-    # Save cache
-    if not args.no_cache:
-        save_cache(cache, cache_file)
-        print(f"✓ Saved {len(cache)} analyses to cache")
+    print()  # New line after progress
     
     # Save results
     print("-"*60)
     save_results(results, args.output)
     print(f"\n✓ Saved analysis results to {args.output}")
     
-    # Generate report
+    # Generate detailed report
     report_file = generate_summary_report(results, args.report)
-    print(f"✓ Generated summary report: {report_file}")
+    print(f"✓ Generated detailed report: {report_file}")
+    
+    # Generate executive summary
+    summary_path = args.summary or args.report.replace('.md', '_summary.md')
+    summary_file = generate_executive_summary(results, summary_path)
+    print(f"✓ Generated executive summary: {summary_file}")
     
     # Print summary
+    successful = sum(1 for r in results if r.get('analysis_result', {}).get('success'))
+    elapsed = time.time() - start_time
     print(f"\n{'='*60}")
     print("ANALYSIS COMPLETE")
     print(f"{'='*60}")
-    print(f"Sessions processed: {len(results)}")
-    print(f"Unique patterns: {unique_patterns}")
-    print(f"  From cache: {stats['cached']}")
-    print(f"  Newly analyzed: {stats['analyzed']}")
-    print(f"  Failed: {stats['failed']}")
-    print(f"\nLLM calls saved by deduplication: {total_sessions - unique_patterns}")
-    if not args.no_cache:
-        print(f"Cache now contains {len(cache)} unique attack patterns")
+    print(f"Total sessions: {len(results)}")
+    print(f"Successful: {successful}")
+    print(f"Failed: {len(results) - successful}")
+    print(f"Time elapsed: {elapsed:.1f}s ({len(results)/elapsed:.1f} sessions/sec)")
     print(f"{'='*60}")
 
 

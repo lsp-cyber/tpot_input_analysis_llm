@@ -1,0 +1,149 @@
+# T-Pot Honeypot Analyzer Configuration
+# ======================================
+#
+# Copy this file to config.yml and edit with your settings:
+#   cp config.example.yml config.yml
+#
+# Settings can be overridden by environment variables or command-line args.
+# Priority (highest to lowest):
+#   1. Command-line arguments
+#   2. Environment variables
+#   3. .env file (if python-dotenv installed)
+#   4. config.yml
+#   5. Default values
+
+# =============================================================================
+# Elasticsearch Configuration
+# =============================================================================
+# Connect to your T-Pot's Elasticsearch instance
+elasticsearch:
+  # T-Pot Elasticsearch host
+  # Environment variable: ES_HOST
+  host: "localhost"
+  
+  # T-Pot Elasticsearch port (default: 64298)
+  # Environment variable: ES_PORT
+  port: 64298
+  
+  # Index pattern to search (T-Pot uses logstash-*)
+  # Environment variable: ES_INDEX_PATTERN
+  index_pattern: "logstash-*"
+  
+  # Query timeout in seconds
+  # Environment variable: ES_TIMEOUT
+  timeout: 60
+  
+  # Maximum log entries to retrieve per query
+  # Environment variable: ES_MAX_RESULTS
+  max_results: 100000
+  
+  # SSL/TLS settings (for secured Elasticsearch)
+  # Environment variables: ES_USE_SSL, ES_VERIFY_CERTS
+  # use_ssl: false
+  # verify_certs: true
+  
+  # Basic authentication (if required)
+  # Environment variables: ES_USERNAME, ES_PASSWORD
+  # username: ""
+  # password: ""
+
+# =============================================================================
+# LM Studio / LLM Configuration
+# =============================================================================
+# Connect to LM Studio or any OpenAI-compatible API endpoint
+lm_studio:
+  # LM Studio host
+  # Environment variable: LLM_HOST
+  host: "localhost"
+  
+  # LM Studio port (default: 1234)
+  # Environment variable: LLM_PORT
+  port: 1234
+  
+  # Request timeout in seconds (increase for slower/larger models)
+  # Environment variable: LLM_TIMEOUT
+  timeout: 120
+  
+  # Delay between sequential API requests (seconds)
+  # Helps avoid overwhelming the server; ignored with --workers > 1
+  # Environment variable: LLM_DELAY
+  delay_between_requests: 0.5
+  
+  # LLM generation parameters
+  # Environment variables: LLM_TEMPERATURE, LLM_MAX_TOKENS
+  temperature: 0.3    # Lower = more focused/deterministic (0.0-1.0)
+  max_tokens: 1000    # Max response length per session
+  
+  # Specific model to use (optional)
+  # If not set, uses whatever model is currently loaded in LM Studio
+  # Environment variable: LLM_MODEL
+  # model: "qwen-2.5-coder-7b"
+  
+  # API key (if required by your endpoint)
+  # Environment variable: LLM_API_KEY
+  # api_key: ""
+
+# =============================================================================
+# Analysis Configuration
+# =============================================================================
+analysis:
+  # Time range to analyze
+  # -----------------------
+  # Set ONE of these options:
+  #
+  # Option 1: Hours (for shorter windows)
+  # lookback_hours: 12      # Last 12 hours
+  # lookback_hours: 24      # Last 24 hours
+  #
+  # Option 2: Days (for longer windows)
+  lookback_days: 1          # Last 1 day
+  # lookback_days: 7        # Last 7 days
+  # lookback_days: 30       # Last 30 days
+  #
+  # If both are set, lookback_hours takes precedence
+  # Can be overridden with --hours or --days command-line args
+  # Environment variables: LOOKBACK_HOURS, LOOKBACK_DAYS
+  
+  # Minimum commands per session to analyze
+  # Sessions with fewer commands are filtered out (usually just probes)
+  # Environment variable: MIN_COMMANDS
+  min_commands: 2
+  
+  # Maximum sessions to analyze (null = no limit)
+  # Useful for testing or limiting processing time
+  # Environment variable: MAX_SESSIONS
+  max_sessions: null
+  
+  # Honeypot types to EXCLUDE from analysis
+  # These are network analysis tools that don't capture shell commands
+  # Environment variable: EXCLUDE_TYPES (comma-separated)
+  exclude_types:
+    - "Fatt"       # Fingerprint All The Things
+    - "Suricata"   # IDS/IPS
+    - "P0f"        # Passive OS fingerprinting
+  
+  # Output directory for results
+  # Each run creates a timestamped subdirectory
+  # Environment variable: OUTPUT_DIR
+  output_dir: "output"
+
+# =============================================================================
+# Example Configurations
+# =============================================================================
+# 
+# Quick test (small dataset):
+#   lookback_hours: 1
+#   max_sessions: 10
+#
+# Daily analysis:
+#   lookback_hours: 24
+#   max_sessions: null
+#
+# Weekly deep analysis:
+#   lookback_days: 7
+#   max_sessions: null
+#
+# Running command:
+#   python run_analysis.py                    # Use config.yml settings
+#   python run_analysis.py --hours 6          # Override to 6 hours
+#   python run_analysis.py --workers 4        # Parallel processing
